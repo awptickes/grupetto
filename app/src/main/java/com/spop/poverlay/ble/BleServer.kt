@@ -13,8 +13,13 @@ import android.content.pm.PackageManager
 import android.os.ParcelUuid
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
+import com.spop.poverlay.BuildConfig
+import com.spop.poverlay.dircon.DirConGattBridge
+import com.spop.poverlay.dircon.DirConServer
+import com.spop.poverlay.dircon.toDirConService
 import com.spop.poverlay.sensor.heartrate.HeartRateManager
 import com.spop.poverlay.sensor.interfaces.SensorInterface
+import com.spop.poverlay.sensor.interfaces.DeviceType
 import java.util.LinkedList
 import java.util.UUID
 import kotlinx.coroutines.*
@@ -36,8 +41,8 @@ class SystemTimeProvider : TimeProvider {
 // Base class for all BLE services
 abstract class BaseBleService(val server: BleServer) {
     abstract val service: BluetoothGattService
-    abstract fun onSensorDataUpdated(cadence: Float, power: Float, speed: Float, resistance: Float)
-    protected val connectedDevices = mutableSetOf<BluetoothDevice>()
+    abstract fun onSensorDataUpdated(cadence: Float, power: Float, speed: Float, resistance: Float, incline: Float)
+    protected val connectedDevices = java.util.concurrent.CopyOnWriteArraySet<BluetoothDevice>()
 
     fun hasConnectedDevices(): Boolean = connectedDevices.isNotEmpty()
 
@@ -105,16 +110,44 @@ class BleServer(
     private var gattServer: BluetoothGattServer? = null
     private var advertiser: BluetoothLeAdvertiser? = null
     private val registeredServices = mutableListOf<BaseBleService>()
+    private var dirConServer: DirConServer? = null
+    private var dirConTransportEnabled = true
+    private var isDirConOnlyStarted = false
     private val servicesToRegister = LinkedList<BaseBleService>()
     private var currentlyRegisteringService: BaseBleService? = null
     private var serviceAddTimeoutJob: Job? = null
-    
+    private var gattServerGeneration = 0L
+
     // Advertising state tracking
-    private var isAdvertising = false
+    @Volatile private var isAdvertising = false
     private var lastAdvertisingStartTime = 0L
     private var lastAdvertisingFailureCode: Int? = null
-    private var isServerStarted = false
+    @Volatile private var isServerStarted = false
     private var heartRateServiceEnabled = false
+    private var bluetoothSuspended = false
+    private var advertisingCallback: AdvertiseCallback? = null
+    private var advertisingRestartJob: Job? = null
+
+    private data class PendingNotification(
+        val device: BluetoothDevice,
+        val characteristic: BluetoothGattCharacteristic,
+        val confirm: Boolean,
+        val value: ByteArray,
+        val coalescible: Boolean
+    )
+
+    // All queue operations use the BleServer monitor, including generation-scoped callbacks.
+    private val pendingNotifications = mutableListOf<PendingNotification>()
+    private var notificationInFlight: PendingNotification? = null
+    private var notificationTimeoutJob: Job? = null
+    private val connectedDevices = mutableSetOf<BluetoothDevice>()
+    private val telemetryUuids = setOf(
+        FitnessMachineConstants.IndoorBikeDataUUID,
+        FitnessMachineConstants.TreadmillDataUUID,
+        CyclingPowerConstants.MeasurementUUID,
+        CyclingSpeedAndCadenceConstants.MeasurementUUID,
+        HeartRateConstants.MeasurementUUID
+    )
 
     // CCCD UUID for checking notification subscriptions
     private val CLIENT_CHARACTERISTIC_CONFIG = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
@@ -127,6 +160,8 @@ class BleServer(
         private const val WATCHDOG_INITIAL_DELAY_MS = 60_000L // 1 minute
         private const val WATCHDOG_CHECK_INTERVAL_MS = 120_000L // 2 minutes
         private const val SERVICE_ADD_TIMEOUT_MS = 2_000L
+        private const val MAX_PENDING_NOTIFICATIONS = 64
+        private const val NOTIFICATION_TIMEOUT_MS = 5_000L
         
         // Standard BLE sensors typically update at 1Hz. 
         // We use a slight offset to avoid aliasing with sensor sampling rates.
@@ -174,42 +209,183 @@ class BleServer(
         return characteristic.value ?: ByteArray(0)
     }
 
+    private fun toHex(value: ByteArray?): String {
+        if (value == null || value.isEmpty()) return "<empty>"
+        return value.joinToString(" ") { b -> "%02X".format(b.toInt() and 0xFF) }
+    }
+
+    fun logBleDebug(message: String) {
+        Timber.d(message)
+    }
+
+    fun logBleWarn(message: String, throwable: Throwable? = null) {
+        if (throwable == null) Timber.w(message) else Timber.w(throwable, message)
+    }
+
+    fun logBleError(message: String, throwable: Throwable? = null) {
+        if (throwable == null) Timber.e(message) else Timber.e(throwable, message)
+    }
+
     //ADD OR EDIT SERVICES HERE
     private fun setupServices() {
-        servicesToRegister.addAll(baseServices(heartRateEnabled = heartRateServiceEnabled))
+        servicesToRegister.addAll(baseServices())
         registerNextService()
     }
 
-    private fun baseServices(heartRateEnabled: Boolean): List<BaseBleService> {
-        val services = mutableListOf<BaseBleService>(
-            FitnessMachineService(this),
-            CyclingPowerService(this),
-            CyclingSpeedAndCadenceService(this),
-            DeviceInformationService(this)
-        )
-        if (heartRateEnabled) {
-            services.add(HeartRateService(this))
+    private val dirConBridge = object : DirConGattBridge {
+        override fun services() = advertisedServices().map { it.service.toDirConService() }
+
+        override fun readCharacteristic(uuid: UUID): ByteArray? = synchronized(this@BleServer) {
+            val characteristic = findGattCharacteristic(uuid) ?: return@synchronized null
+            characteristicValue(characteristic)
         }
-        return services
+
+        override fun writeCharacteristic(uuid: UUID, value: ByteArray): Boolean {
+            // Control writes require a session identity; the session-aware overload handles them.
+            if (uuid == FitnessMachineConstants.ControlPointUUID) return false
+            val characteristic = findGattCharacteristic(uuid) ?: return false
+            val writable = characteristic.properties and
+                (BluetoothGattCharacteristic.PROPERTY_WRITE or
+                    BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
+            if (!writable) return false
+
+            @Suppress("DEPRECATION")
+            characteristic.value = value
+            return true
+        }
+
+        override fun writeCharacteristic(client: String, uuid: UUID, value: ByteArray): Boolean {
+            if (uuid != FitnessMachineConstants.ControlPointUUID) return writeCharacteristic(uuid, value)
+            val service = advertisedServices().filterIsInstance<FitnessMachineService>().firstOrNull() ?: return false
+            val response = service.handleControl(client, value)
+            dirConServer?.notifyCharacteristicChanged(uuid, response, client)
+            return true
+        }
+
+        override fun disconnected(client: String) { sensorInterface.bikeControl?.disconnect(client) }
     }
 
+    private fun baseServices(): List<BaseBleService> {
+        return buildList {
+            add(FitnessMachineService(this@BleServer, sensorInterface.deviceType, sensorInterface.bikeControl))
+            if (sensorInterface.deviceType != DeviceType.Tread) {
+                add(CyclingPowerService(this@BleServer))
+                add(CyclingSpeedAndCadenceService(this@BleServer))
+            }
+            add(DeviceInformationService(this@BleServer))
+            // Keep the GATT database stable for the lifetime of the server. Rebuilding the
+            // database when a heart-rate sensor connects can race Android's asynchronous
+            // service deletion, particularly on Android 11 vendor Bluetooth stacks.
+            add(HeartRateService(this@BleServer))
+        }
+    }
+
+    private fun advertisedServices(): List<BaseBleService> =
+        registeredServices.filter {
+            heartRateServiceEnabled || it.service.uuid != HeartRateConstants.ServiceUUID
+        }
+
+    private fun callbackForGeneration(generation: Long) =
+        object : BluetoothGattServerCallback() {
+            private fun dispatch(callback: () -> Unit) {
+                synchronized(this@BleServer) {
+                    if (generation != gattServerGeneration || gattServer == null) {
+                        Timber.d("Ignoring callback from stale GATT server generation $generation")
+                        return
+                    }
+                    callback()
+                }
+            }
+
+            override fun onServiceAdded(status: Int, service: BluetoothGattService) =
+                dispatch { this@BleServer.onServiceAdded(status, service) }
+
+            override fun onConnectionStateChange(
+                device: BluetoothDevice?,
+                status: Int,
+                newState: Int
+            ) = dispatch { this@BleServer.onConnectionStateChange(device, status, newState) }
+
+            override fun onMtuChanged(device: BluetoothDevice?, mtu: Int) =
+                dispatch { this@BleServer.onMtuChanged(device, mtu) }
+
+            override fun onNotificationSent(device: BluetoothDevice, status: Int) =
+                dispatch { this@BleServer.onNotificationSent(device, status) }
+
+            override fun onCharacteristicWriteRequest(
+                device: BluetoothDevice,
+                requestId: Int,
+                characteristic: BluetoothGattCharacteristic,
+                preparedWrite: Boolean,
+                responseNeeded: Boolean,
+                offset: Int,
+                value: ByteArray?
+            ) = dispatch {
+                this@BleServer.onCharacteristicWriteRequest(
+                    device,
+                    requestId,
+                    characteristic,
+                    preparedWrite,
+                    responseNeeded,
+                    offset,
+                    value
+                )
+            }
+
+            override fun onCharacteristicReadRequest(
+                device: BluetoothDevice,
+                requestId: Int,
+                offset: Int,
+                characteristic: BluetoothGattCharacteristic
+            ) = dispatch {
+                this@BleServer.onCharacteristicReadRequest(device, requestId, offset, characteristic)
+            }
+
+            override fun onDescriptorReadRequest(
+                device: BluetoothDevice,
+                requestId: Int,
+                offset: Int,
+                descriptor: BluetoothGattDescriptor
+            ) = dispatch {
+                this@BleServer.onDescriptorReadRequest(device, requestId, offset, descriptor)
+            }
+
+            override fun onDescriptorWriteRequest(
+                device: BluetoothDevice,
+                requestId: Int,
+                descriptor: BluetoothGattDescriptor,
+                preparedWrite: Boolean,
+                responseNeeded: Boolean,
+                offset: Int,
+                value: ByteArray?
+            ) = dispatch {
+                this@BleServer.onDescriptorWriteRequest(
+                    device,
+                    requestId,
+                    descriptor,
+                    preparedWrite,
+                    responseNeeded,
+                    offset,
+                    value
+                )
+            }
+        }
+
+    @Synchronized
     fun start() {
         if (isServerStarted) {
             Timber.d("BLE server already started, ignoring duplicate start()")
             return
+        }
+        logBleDebug("BLE_DEBUG: App version ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
+        if (isDirConOnlyStarted) {
+            stopDirConOnly()
         }
         val bluetoothAdapter = bluetoothManager.adapter
         if (bluetoothAdapter == null) {
             Timber.e("Bluetooth adapter is null")
             return
         }
-
-        val localAdvertiser = bluetoothAdapter.bluetoothLeAdvertiser
-        if (localAdvertiser == null) {
-            Timber.e("Failed to create advertiser")
-            return
-        }
-        advertiser = localAdvertiser
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val hasConnectPermission = ContextCompat.checkSelfPermission(
@@ -231,13 +407,42 @@ class BleServer(
             }
         }
 
+        bluetoothSuspended = false
+        if (!isBluetoothReady()) return
+
+        // setIncludeDeviceName uses the shared adapter name, not our GATT model string.
+        // Request the original name before service registration starts advertising.
         try {
-            val server = bluetoothManager.openGattServer(context, this)
+            if (bluetoothAdapter.name != "Grupetto") {
+                if (bluetoothAdapter.setName("Grupetto")) {
+                    Timber.d("Bluetooth adapter name change to Grupetto accepted")
+                } else {
+                    Timber.w("Bluetooth adapter rejected the Grupetto name; retaining its current name")
+                }
+            }
+        } catch (e: SecurityException) {
+            Timber.w(e, "Missing Bluetooth permission to set adapter name")
+        } catch (e: Exception) {
+            Timber.w(e, "Failed to set Bluetooth adapter name")
+        }
+
+        if (!isBluetoothReady()) return
+        try {
+            advertiser = bluetoothAdapter.bluetoothLeAdvertiser ?: return
+        } catch (e: RuntimeException) {
+            Timber.w(e, "Bluetooth became unavailable while getting advertiser")
+            return
+        }
+
+        try {
+            val generation = ++gattServerGeneration
+            val server = bluetoothManager.openGattServer(context, callbackForGeneration(generation))
             if (server == null) {
                 Timber.e("Failed to open GATT server (returned null)")
                 return
             }
             gattServer = server
+            isServerStarted = true
             
             // Register Bluetooth state change receiver
             val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
@@ -252,7 +457,6 @@ class BleServer(
             startWatchdog()
             startHeartRateServiceWatcher()
             
-            isServerStarted = true
         } catch (e: SecurityException) {
             Timber.e(e, "Failed to open GATT server due to missing Bluetooth permission")
             stop() // Clean up partial initialization
@@ -262,12 +466,14 @@ class BleServer(
         }
     }
 
+    @Synchronized
     private fun registerNextService() {
         if (servicesToRegister.isEmpty()) {
             currentlyRegisteringService = null
             serviceAddTimeoutJob?.cancel()
             serviceAddTimeoutJob = null
             startAdvertising()
+            startDirCon()
             startSensorDataUpdates()
         } else {
             currentlyRegisteringService = servicesToRegister.pop()
@@ -279,12 +485,15 @@ class BleServer(
                     return
                 }
                 serviceAddTimeoutJob?.cancel()
+                val generation = gattServerGeneration
+                val service = currentlyRegisteringService
                 serviceAddTimeoutJob = launch {
                     delay(SERVICE_ADD_TIMEOUT_MS)
-                    val pending = currentlyRegisteringService
-                    if (pending != null) {
-                        currentlyRegisteringService = null
-                        registerNextService()
+                    synchronized(this@BleServer) {
+                        if (generation == gattServerGeneration && currentlyRegisteringService === service) {
+                            currentlyRegisteringService = null
+                            registerNextService()
+                        }
                     }
                 }
             } catch (e: SecurityException) {
@@ -295,59 +504,129 @@ class BleServer(
         }
     }
 
+    @Synchronized
     fun stop() {
+        sensorInterface.bikeControl?.disconnectTransport("ble:")
+        isServerStarted = false
+        isDirConOnlyStarted = false
+        gattServerGeneration++
+        clearNotificationState()
+        advertisingRestartJob?.cancel()
+        advertisingRestartJob = null
+
+        // Detach first so no callback or concurrent operation can use a server once teardown starts.
+        val serverToClose = gattServer
+        gattServer = null
+        serviceAddTimeoutJob?.cancel()
+        serviceAddTimeoutJob = null
+        servicesToRegister.clear()
+        currentlyRegisteringService = null
+
+        // Closing the detached registration is the highest-priority teardown operation.
+        closeGattServer(serverToClose)
+
+        stopWatchdog()
+        stopSensorDataUpdates()
+        stopHeartRateServiceWatcher()
+        stopDirCon()
+        stopAdvertising()
+            
+        // Unregister Bluetooth state change receiver
         try {
-            isServerStarted = false
-            stopWatchdog()
-            stopSensorDataUpdates()
-            stopHeartRateServiceWatcher()
-            stopAdvertising()
-            
-            // Unregister Bluetooth state change receiver
-            try {
-                context.unregisterReceiver(bluetoothStateReceiver)
-                Timber.d("Unregistered Bluetooth state change receiver")
-            } catch (e: IllegalArgumentException) {
-                // Receiver was not registered, this is normal if stop() called without start()
-                Timber.d("Bluetooth state receiver was not registered (normal if not started)")
-            }
-            try {
-                context.unregisterReceiver(bondStateReceiver)
-            } catch (e: IllegalArgumentException) {
-                Timber.d("Bond state receiver was not registered")
-            }
-            
-            gattServer?.clearServices()
-            gattServer?.close()
-            gattServer = null
-            registeredServices.clear()
-            servicesToRegister.clear()
-            currentlyRegisteringService = null
-            heartRateServiceEnabled = false
-            
-            // Reset state tracking
-            isAdvertising = false
-            lastAdvertisingStartTime = 0L
-            lastAdvertisingFailureCode = null
-            
-            // Reset smoothing and CSC state so a restart begins fresh
-            smoothedCadence = null
-            smoothedPower = null
-            smoothedSpeedMph = null
-            smoothedResistance = null
-            cscCrankResidual = 0.0
-            cscWheelResidual = 0.0
-            cscCumulativeWheelRev = 0L
-            cscLastWheelEvtTime = 0
-            cscCumulativeCrankRev = 0
-            cscLastCrankEvtTime = 0
-            
-            synchronized(notificationSubscriptions) {
-                notificationSubscriptions.clear()
-            }
-        } catch (e: SecurityException) {
-            Timber.e(e, "Missing bluetooth permissions")
+            context.unregisterReceiver(bluetoothStateReceiver)
+            Timber.d("Unregistered Bluetooth state change receiver")
+        } catch (e: IllegalArgumentException) {
+            // Receiver was not registered, this is normal if stop() called without start()
+            Timber.d("Bluetooth state receiver was not registered (normal if not started)")
         }
+        try {
+            context.unregisterReceiver(bondStateReceiver)
+        } catch (e: IllegalArgumentException) {
+            Timber.d("Bond state receiver was not registered")
+        }
+
+        registeredServices.clear()
+        heartRateServiceEnabled = false
+            
+        // Reset state tracking
+        isAdvertising = false
+        lastAdvertisingStartTime = 0L
+        lastAdvertisingFailureCode = null
+            
+        // Reset smoothing and CSC state so a restart begins fresh
+        smoothedCadence = null
+        smoothedPower = null
+        smoothedSpeedMph = null
+        cscCrankResidual = 0.0
+        cscWheelResidual = 0.0
+        cscCumulativeWheelRev = 0L
+        cscLastWheelEvtTime = 0
+        cscCumulativeCrankRev = 0
+        cscLastCrankEvtTime = 0
+            
+        synchronized(notificationSubscriptions) {
+            notificationSubscriptions.clear()
+        }
+    }
+
+    private fun closeGattServer(server: BluetoothGattServer?) {
+        if (server == null) return
+
+        // BluetoothGattServer.close() unregisters the server, and Android's GattService
+        // deletes all of its services as part of that operation. Calling clearServices()
+        // immediately before close() starts the same asynchronous deletion twice. Some
+        // Android 11 vendor stacks then throw ConcurrentModificationException in
+        // GattService.deleteServices(), leaving orphaned native services behind.
+        try {
+            server.close()
+        } catch (e: SecurityException) {
+            Timber.e(e, "Missing bluetooth permissions while closing GATT server")
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to close GATT server")
+        }
+    }
+
+    fun setDirConTransportEnabled(enabled: Boolean) {
+        dirConTransportEnabled = enabled
+        if (enabled) {
+            if (isServerStarted) {
+                startDirCon()
+            } else {
+                startDirConOnly()
+            }
+        } else if (isDirConOnlyStarted) {
+            stopDirConOnly()
+        } else {
+            stopDirCon()
+        }
+    }
+
+    fun startDirConOnly() {
+        if (!dirConTransportEnabled || isServerStarted || isDirConOnlyStarted) {
+            return
+        }
+
+        heartRateServiceEnabled = HeartRateManager.connectedDevice.value != null
+        registeredServices.clear()
+        registeredServices.addAll(baseServices())
+        startDirCon()
+        startSensorDataUpdates()
+        isDirConOnlyStarted = true
+        Timber.i("DIRCON-only transport started")
+    }
+
+    fun stopDirConOnly() {
+        if (!isDirConOnlyStarted) {
+            stopDirCon()
+            return
+        }
+
+        stopDirCon()
+        stopSensorDataUpdates()
+        registeredServices.clear()
+        isDirConOnlyStarted = false
+        heartRateServiceEnabled = false
+        Timber.i("DIRCON-only transport stopped")
     }
 
     private fun startHeartRateServiceWatcher() {
@@ -369,50 +648,168 @@ class BleServer(
         heartRateServiceWatcherJob = null
     }
 
+    @Synchronized
     private fun updateHeartRateServiceRegistration(enable: Boolean) {
+        if (!isServerStarted || gattServer == null) return
+
         heartRateServiceEnabled = enable
         Timber.i("Heart rate BLE service ${if (enable) "enabled" else "disabled"}")
 
-        stopSensorDataUpdates()
-        stopAdvertising()
-        gattServer?.clearServices()
-        registeredServices.clear()
-        servicesToRegister.clear()
-        currentlyRegisteringService = null
+        if (currentlyRegisteringService != null || servicesToRegister.isNotEmpty()) {
+            Timber.d("Deferring heart-rate advertisement update until GATT setup completes")
+            return
+        }
 
-        servicesToRegister.addAll(baseServices(heartRateEnabled = enable))
-        registerNextService()
+        // The heart-rate GATT service is registered up front. Only its discoverability is
+        // changed here, so connecting/disconnecting a sensor never mutates the live GATT
+        // database or races the platform's asynchronous service cleanup.
+        stopDirCon()
+        stopAdvertising()
+        startAdvertising()
+        startDirCon()
     }
 
+    private fun startDirCon() {
+        if (!dirConTransportEnabled || dirConServer != null || registeredServices.isEmpty()) {
+            return
+        }
+
+        dirConServer = DirConServer(
+            context = context,
+            bridge = dirConBridge,
+            serialNumberProvider = { serialNumber() }
+        ).also { it.start() }
+    }
+
+    private fun stopDirCon() {
+        dirConServer?.stop()
+        dirConServer = null
+    }
+
+    @Synchronized
     fun notifyCharacteristicChanged(
             device: BluetoothDevice,
             characteristic: BluetoothGattCharacteristic,
             confirm: Boolean
     ) {
+        if (!isServerStarted || gattServer == null || !isBluetoothReady()) return
         // Convention compliance: Only notify if subscribed (handled by tracking CCCD writes)
         val isSubscribed = synchronized(notificationSubscriptions) {
             notificationSubscriptions[device.address]?.contains(characteristic.uuid) == true
         }
 
         if (!isSubscribed) {
-             return
+            logBleDebug("BLE notify skipped (not subscribed) dev=${device.address} ch=${characteristic.uuid}")
+            return
         }
 
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gattServer?.notifyCharacteristicChanged(
-                    device,
-                    characteristic,
-                    confirm,
-                    characteristicValue(characteristic)
-                )
-            } else {
-                @Suppress("DEPRECATION")
-                gattServer?.notifyCharacteristicChanged(device, characteristic, confirm)
+        val pending = PendingNotification(device, characteristic, confirm,
+            characteristicValue(characteristic).copyOf(), !confirm && characteristic.uuid in telemetryUuids)
+        val replaced = if (pending.coalescible) pendingNotifications.indexOfFirst {
+            it.coalescible && it.device == device && it.characteristic === characteristic
+        } else -1
+        if (replaced >= 0) {
+            pendingNotifications[replaced] = pending
+        } else {
+            if (pendingNotifications.size >= MAX_PENDING_NOTIFICATIONS) {
+                val obsolete = pendingNotifications.indexOfFirst { it.coalescible }
+                if (obsolete >= 0) {
+                    pendingNotifications.removeAt(obsolete)
+                } else {
+                    logBleWarn("BLE notification queue full dev=${device.address} ch=${characteristic.uuid}")
+                    // A control response cannot be silently discarded while keeping its session alive.
+                    if (!pending.coalescible) disconnectNotificationClient(device)
+                    return
+                }
             }
-        } catch (e: SecurityException) {
-            Timber.e(e, "Missing bluetooth permissions")
+            pendingNotifications.add(pending)
         }
+        sendNextNotification()
+    }
+
+    private fun sendNextNotification() {
+        if (notificationInFlight != null || !isServerStarted || !isBluetoothReady()) return
+        val server = gattServer ?: return
+        while (pendingNotifications.isNotEmpty()) {
+            val pending = pendingNotifications.removeAt(0)
+            if (notificationSubscriptions[pending.device.address]?.contains(pending.characteristic.uuid) != true) continue
+            notificationInFlight = pending
+            val accepted = try {
+                sendGattNotification(server, pending.device, pending.characteristic, pending.confirm, pending.value)
+            } catch (e: RuntimeException) {
+                logBleWarn("BLE notification submission failed ch=${pending.characteristic.uuid}", e)
+                false
+            }
+            if (!accepted) {
+                notificationInFlight = null
+                logBleWarn("BLE notification rejected dev=${pending.device.address} ch=${pending.characteristic.uuid}")
+                disconnectNotificationClient(pending.device)
+                continue
+            }
+            val generation = gattServerGeneration
+            notificationTimeoutJob = launch {
+                delay(NOTIFICATION_TIMEOUT_MS)
+                synchronized(this@BleServer) {
+                    handleNotificationTimeout(generation, pending)
+                }
+            }
+            return
+        }
+    }
+
+    private fun handleNotificationTimeout(generation: Long, pending: PendingNotification) {
+        if (generation != gattServerGeneration || notificationInFlight !== pending) return
+        logBleWarn("BLE notification timed out dev=${pending.device.address} ch=${pending.characteristic.uuid}")
+        // Callbacks identify only the device, not the packet. Retire the registration before
+        // sending again, otherwise a late callback could release a newer packet for that device.
+        restartGattAndAdvertising("notification completion timeout")
+    }
+
+    @Synchronized
+    override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+        val pending = notificationInFlight ?: return
+        if (pending.device != device) return
+        notificationTimeoutJob?.cancel()
+        notificationTimeoutJob = null
+        notificationInFlight = null
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            logBleWarn("BLE notification failed dev=${device.address} ch=${pending.characteristic.uuid} status=$status")
+            disconnectNotificationClient(device)
+        }
+        sendNextNotification()
+    }
+
+    private fun disconnectNotificationClient(device: BluetoothDevice) {
+        pendingNotifications.removeAll { it.device == device }
+        notificationSubscriptions.remove(device.address)
+        connectedDevices.remove(device)
+        registeredServices.forEach { it.onDisconnected(device) }
+        try {
+            gattServer?.cancelConnection(device)
+        } catch (e: SecurityException) {
+            logBleWarn("Missing Bluetooth permission while disconnecting dev=${device.address}", e)
+        } catch (e: RuntimeException) {
+            logBleWarn("BLE client disconnect failed dev=${device.address}", e)
+        }
+    }
+
+    private fun clearNotificationState() {
+        notificationTimeoutJob?.cancel()
+        notificationTimeoutJob = null
+        notificationInFlight = null
+        pendingNotifications.clear()
+        notificationSubscriptions.clear()
+        connectedDevices.toList().forEach { device ->
+            registeredServices.forEach { it.onDisconnected(device) }
+        }
+        connectedDevices.clear()
+    }
+
+    fun notifyDirConCharacteristicChanged(characteristic: BluetoothGattCharacteristic) {
+        dirConServer?.notifyCharacteristicChanged(
+            characteristic.uuid,
+            characteristicValue(characteristic)
+        )
     }
 
     fun sendResponse(
@@ -429,22 +826,33 @@ class BleServer(
         }
     }
     
+    @Synchronized
     private fun handleBluetoothStateChange(state: Int) {
         when (state) {
-            BluetoothAdapter.STATE_OFF -> {
-                Timber.w("Bluetooth turned off, stopping advertising")
-                isAdvertising = false
-                // Don't call stopAdvertising() as Bluetooth is already off
+            BluetoothAdapter.STATE_OFF, BluetoothAdapter.STATE_TURNING_OFF -> {
+                bluetoothSuspended = true
+                sensorInterface.bikeControl?.disconnectTransport("ble:")
+                advertisingRestartJob?.cancel()
+                advertisingRestartJob = null
+                stopAdvertising()
+                clearNotificationState()
+                // Retire the registration but keep the receiver and intent to run on STATE_ON.
+                gattServerGeneration++
+                val serverToClose = gattServer
+                gattServer = null
+                serviceAddTimeoutJob?.cancel()
+                serviceAddTimeoutJob = null
+                currentlyRegisteringService = null
+                servicesToRegister.clear()
+                closeGattServer(serverToClose)
+                Timber.i("Bluetooth shutting down; BLE work suspended")
             }
             BluetoothAdapter.STATE_ON -> {
+                bluetoothSuspended = false
                 Timber.i("Bluetooth turned on, attempting to restart advertising")
                 if (isServerStarted) {
                     restartGattAndAdvertising("Bluetooth turned on")
                 }
-            }
-            BluetoothAdapter.STATE_TURNING_OFF -> {
-                Timber.d("Bluetooth turning off")
-                isAdvertising = false
             }
             BluetoothAdapter.STATE_TURNING_ON -> {
                 Timber.d("Bluetooth turning on")
@@ -452,6 +860,13 @@ class BleServer(
         }
     }
     
+    private fun isBluetoothReady(): Boolean = try {
+        !bluetoothSuspended && bluetoothManager.adapter?.state == BluetoothAdapter.STATE_ON
+    } catch (e: SecurityException) {
+        Timber.w(e, "Cannot access Bluetooth adapter state")
+        false
+    }
+
     private fun startWatchdog() {
         stopWatchdog()
         watchdogJob = launch {
@@ -481,6 +896,7 @@ class BleServer(
         return registeredServices.any { it.hasConnectedDevices() }
     }
     
+    @Synchronized
     private fun checkAndRestartAdvertising() {
         val bluetoothAdapter = bluetoothManager.adapter
         
@@ -489,9 +905,14 @@ class BleServer(
             return
         }
         
-        if (!bluetoothAdapter.isEnabled) {
+        if (!isServerStarted || !isBluetoothReady()) {
             Timber.d("Watchdog: Bluetooth is disabled; skipping auto-enable to avoid interfering with other apps")
             isAdvertising = false
+            return
+        }
+
+        if (gattServer == null) {
+            restartGattAndAdvertising("GATT registration unavailable")
             return
         }
         
@@ -519,34 +940,44 @@ class BleServer(
             
             Timber.w("Watchdog: Advertising is not active, reason: $reason. Restarting...")
             
-            // If we have connected devices, just restart advertising (don't reset GATT server)
-            if (hasConnectedDevices()) {
-                Timber.i("Restarting advertising only (preserving connections)")
-                startAdvertising()
-            } else {
-                // No connections, safe to do full restart
-                restartGattAndAdvertising("Watchdog detected inactive advertising")
-            }
+            // Retrying advertising does not require rebuilding the GATT database. Rebuilding
+            // here can repeatedly exercise buggy vendor teardown paths and orphan services.
+            Timber.i("Retrying advertising without rebuilding the GATT server")
+            startAdvertising()
         } else if (isAdvertising) {
             val timeSinceStart = System.currentTimeMillis() - lastAdvertisingStartTime
             Timber.d("Watchdog: Advertising active for ${timeSinceStart / 1000}s")
         }
     }
     
+    @Synchronized
     private fun restartGattAndAdvertising(reason: String) {
+        if (!isServerStarted) {
+            Timber.d("Ignoring GATT restart after server was stopped: $reason")
+            return
+        }
+
         Timber.i("Restarting GATT and advertising: $reason")
+        sensorInterface.bikeControl?.disconnectTransport("ble:")
         
         try {
             // Stop current advertising
             stopAdvertising()
+            clearNotificationState()
+            stopSensorDataUpdates()
             
             // Close and reopen GATT server
-            gattServer?.clearServices()
-            gattServer?.close()
+            val serverToClose = gattServer
             gattServer = null
+            gattServerGeneration++
+            serviceAddTimeoutJob?.cancel()
+            serviceAddTimeoutJob = null
+            servicesToRegister.clear()
+            currentlyRegisteringService = null
+            closeGattServer(serverToClose)
             
             val bluetoothAdapter = bluetoothManager.adapter
-            if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
+            if (bluetoothAdapter == null || !isBluetoothReady()) {
                 Timber.e("Cannot restart: Bluetooth not available")
                 return
             }
@@ -557,18 +988,20 @@ class BleServer(
                 return
             }
             
-            gattServer = bluetoothManager.openGattServer(context, this)
-            if (gattServer == null) {
+            val generation = ++gattServerGeneration
+            val replacement = bluetoothManager.openGattServer(
+                context,
+                callbackForGeneration(generation)
+            )
+            if (replacement == null) {
                 Timber.e("Cannot restart: Failed to open GATT server")
                 return
             }
+            gattServer = replacement
             
             // Re-register all services
-            val savedServices = registeredServices.toList()
             registeredServices.clear()
-            servicesToRegister.clear()
-            servicesToRegister.addAll(savedServices)
-            currentlyRegisteringService = null
+            servicesToRegister.addAll(baseServices())
             
             registerNextService()
             
@@ -579,11 +1012,12 @@ class BleServer(
         }
     }
 
+    @Synchronized
     private fun startAdvertising() {
-        if (isAdvertising) {
+        if (!isServerStarted || gattServer == null || !isBluetoothReady() || advertisingCallback != null) {
             return
         }
-        val serviceUuids = registeredServices.map { ParcelUuid(it.service.uuid) }
+        val serviceUuids = advertisedServices().map { ParcelUuid(it.service.uuid) }
         if (serviceUuids.isEmpty()) {
             return
         }
@@ -601,6 +1035,8 @@ class BleServer(
                 advDataBuilder.addServiceUuid(uuid)
             }
 
+            logBleDebug("BLE advertising UUIDs: ${serviceUuids.joinToString { it.uuid.toString() }}")
+
             // Scan response: include device name and manufacturer specific data
             val scanResponseBuilder = AdvertiseData.Builder()
                 .setIncludeDeviceName(true)
@@ -611,58 +1047,86 @@ class BleServer(
             // Keep payload concise to fit scan response size constraints
             val manufacturerData = "GRUP-$sn".toByteArray(Charsets.UTF_8)
             scanResponseBuilder.addManufacturerData(manufacturerId, manufacturerData)
+            logBleDebug("BLE scan response manufacturerId=0x${manufacturerId.toString(16)} data=${String(manufacturerData)}")
 
-            advertiser?.startAdvertising(
+            val activeAdvertiser = advertiser ?: return
+            val callback = newAdvertisingCallback(gattServerGeneration)
+            advertisingCallback = callback
+            activeAdvertiser.startAdvertising(
                 settings,
                 advDataBuilder.build(),
                 scanResponseBuilder.build(),
-                advertisingCallback
+                callback
             )
         } catch (e: SecurityException) {
+            advertisingCallback = null
+            isAdvertising = false
             Timber.e(e, "Missing bluetooth permissions")
         } catch (e: IllegalArgumentException) {
+            advertisingCallback = null
+            isAdvertising = false
             // Thrown if advertise data exceeds the allowed size
             Timber.e(e, "Invalid advertise data: %s", e.message)
+        } catch (e: IllegalStateException) {
+            advertisingCallback = null
+            isAdvertising = false
+            Timber.w(e, "Bluetooth became unavailable while starting advertising")
         }
     }
 
+    @Synchronized
     private fun stopAdvertising() {
+        val callback = advertisingCallback
+        advertisingCallback = null
+        isAdvertising = false
         try {
-            advertiser?.stopAdvertising(advertisingCallback)
-            isAdvertising = false
+            if (callback != null && isBluetoothReady()) advertiser?.stopAdvertising(callback)
             Timber.d("Stopped advertising")
         } catch (e: SecurityException) {
             Timber.e(e, "Missing bluetooth permissions")
+        } catch (e: IllegalStateException) {
+            Timber.w(e, "Bluetooth became unavailable while stopping advertising")
         }
     }
 
-    private val advertisingCallback =
+    private fun newAdvertisingCallback(generation: Long): AdvertiseCallback =
             object : AdvertiseCallback() {
                 override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
-                    isAdvertising = true
-                    lastAdvertisingStartTime = System.currentTimeMillis()
-                    lastAdvertisingFailureCode = null
-                    Timber.i("BLE advertising started successfully")
+                    synchronized(this@BleServer) {
+                        if (advertisingCallback !== this || generation != gattServerGeneration ||
+                            !isServerStarted || !isBluetoothReady()) return
+                        isAdvertising = true
+                        lastAdvertisingStartTime = System.currentTimeMillis()
+                        lastAdvertisingFailureCode = null
+                        logBleDebug("BLE advertising started")
+                    }
                 }
 
                 override fun onStartFailure(errorCode: Int) {
-                    isAdvertising = false
-                    lastAdvertisingFailureCode = errorCode
-                    val errorMessage = when (errorCode) {
-                        AdvertiseCallback.ADVERTISE_FAILED_DATA_TOO_LARGE -> "Data too large"
-                        AdvertiseCallback.ADVERTISE_FAILED_TOO_MANY_ADVERTISERS -> "Too many advertisers"
-                        AdvertiseCallback.ADVERTISE_FAILED_ALREADY_STARTED -> "Already started"
-                        AdvertiseCallback.ADVERTISE_FAILED_INTERNAL_ERROR -> "Internal error"
-                        AdvertiseCallback.ADVERTISE_FAILED_FEATURE_UNSUPPORTED -> "Feature unsupported"
-                        else -> "Unknown error"
-                    }
-                    Timber.e("BLE advertising failed: $errorCode ($errorMessage)")
-                    if (errorCode == AdvertiseCallback.ADVERTISE_FAILED_ALREADY_STARTED) {
-                        isAdvertising = true
+                    synchronized(this@BleServer) {
+                        if (advertisingCallback !== this || generation != gattServerGeneration ||
+                            !isServerStarted || !isBluetoothReady()) return
+                        advertisingCallback = null
+                        isAdvertising = false
+                        lastAdvertisingFailureCode = errorCode
+                        val errorMessage = when (errorCode) {
+                            AdvertiseCallback.ADVERTISE_FAILED_DATA_TOO_LARGE -> "Data too large"
+                            AdvertiseCallback.ADVERTISE_FAILED_TOO_MANY_ADVERTISERS -> "Too many advertisers"
+                            AdvertiseCallback.ADVERTISE_FAILED_ALREADY_STARTED -> "Already started"
+                            AdvertiseCallback.ADVERTISE_FAILED_INTERNAL_ERROR -> "Internal error"
+                            AdvertiseCallback.ADVERTISE_FAILED_FEATURE_UNSUPPORTED -> "Feature unsupported"
+                            else -> "Unknown error"
+                        }
+                        logBleError("BLE advertising failed: $errorCode ($errorMessage)")
+                        if (errorCode == AdvertiseCallback.ADVERTISE_FAILED_ALREADY_STARTED) {
+                            advertisingCallback = this
+                            isAdvertising = true
+                        }
                     }
                 }
             }
 
+    @Synchronized
     override fun onServiceAdded(status: Int, service: BluetoothGattService) {
         serviceAddTimeoutJob?.cancel()
         serviceAddTimeoutJob = null
@@ -684,22 +1148,18 @@ class BleServer(
         registerNextService()
     }
 
+    @Synchronized
     override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
         if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
-            device?.let { 
+            device?.let {
+                connectedDevices.add(device)
                 registeredServices.forEach { it.onConnected(device) }
-                Timber.d("Device connected: ${device.address}")
+                logBleDebug("BLE connected: ${device.address}")
                 
                 // Restart advertising to allow additional clients to connect (support multiple connections)
                 if (!isAdvertising && isServerStarted) {
                     Timber.i("Device connected, restarting advertising to allow more clients")
-                    launch {
-                        // Small delay to ensure connection is fully established
-                        delay(500)
-                        if (!isAdvertising && isServerStarted) {
-                            startAdvertising()
-                        }
-                    }
+                    scheduleAdvertisingRestart()
                 }
             }
         } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
@@ -707,21 +1167,29 @@ class BleServer(
             synchronized(notificationSubscriptions) {
                 notificationSubscriptions.remove(device?.address)
             }
-            device?.let { 
+            device?.let {
+                connectedDevices.remove(device)
+                pendingNotifications.removeAll { it.device == device }
+                // Keep outstanding sends until callback/timeout, even on disconnect.
                 registeredServices.forEach { it.onDisconnected(device) }
-                Timber.d("Device disconnected: ${device.address}")
+                logBleDebug("BLE disconnected: ${device.address}")
                 
                 // Restart advertising if no devices are connected anymore
                 if (!hasConnectedDevices() && !isAdvertising && isServerStarted) {
                     Timber.i("Last device disconnected, restarting advertising")
-                    launch {
-                        // Small delay to ensure disconnect is fully processed
-                        delay(500)
-                        if (!hasConnectedDevices() && !isAdvertising) {
-                            startAdvertising()
-                        }
-                    }
+                    scheduleAdvertisingRestart()
                 }
+            }
+        }
+    }
+
+    private fun scheduleAdvertisingRestart() {
+        advertisingRestartJob?.cancel()
+        val generation = gattServerGeneration
+        advertisingRestartJob = launch {
+            delay(500)
+            synchronized(this@BleServer) {
+                if (generation == gattServerGeneration) startAdvertising()
             }
         }
     }
@@ -734,6 +1202,13 @@ class BleServer(
         return registeredServices.firstOrNull { it.service.uuid == uuid }
     }
 
+    private fun findGattCharacteristic(uuid: UUID): BluetoothGattCharacteristic? {
+        return registeredServices
+            .asSequence()
+            .flatMap { it.service.characteristics.asSequence() }
+            .firstOrNull { it.uuid == uuid }
+    }
+
     override fun onCharacteristicWriteRequest(
             device: BluetoothDevice,
             requestId: Int,
@@ -743,6 +1218,9 @@ class BleServer(
             offset: Int,
             value: ByteArray?
     ) {
+        logBleDebug(
+            "BLE write req dev=${device.address} svc=${characteristic.service.uuid} ch=${characteristic.uuid} prepared=$preparedWrite resp=$responseNeeded offset=$offset value=${toHex(value)}"
+        )
         findServiceForCharacteristic(characteristic.service.uuid)
                 ?.onCharacteristicWriteRequest(
                         device,
@@ -763,22 +1241,26 @@ class BleServer(
     ) {
         val service = findServiceForCharacteristic(characteristic.service.uuid)
         if (service == null) {
+            logBleWarn("BLE read req failed (service missing) dev=${device.address} svc=${characteristic.service.uuid} ch=${characteristic.uuid}")
             sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, offset, null)
             return
         }
-        sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, characteristicValue(characteristic))
+        val value = characteristicValue(characteristic)
+        logBleDebug("BLE read req dev=${device.address} svc=${characteristic.service.uuid} ch=${characteristic.uuid} offset=$offset value=${toHex(value)}")
+        sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
     }
 
     override fun onDescriptorReadRequest(
-            device: BluetoothDevice,
-            requestId: Int,
-            offset: Int,
-            descriptor: BluetoothGattDescriptor
+        device: BluetoothDevice,
+        requestId: Int,
+        offset: Int,
+        descriptor: BluetoothGattDescriptor
     ) {
         findServiceForCharacteristic(descriptor.characteristic.service.uuid)
-                ?.onDescriptorReadRequest(device, requestId, offset, descriptor)
+            ?.onDescriptorReadRequest(device, requestId, offset, descriptor)
     }
 
+    @Synchronized
     override fun onDescriptorWriteRequest(
             device: BluetoothDevice,
             requestId: Int,
@@ -788,24 +1270,31 @@ class BleServer(
             offset: Int,
             value: ByteArray?
     ) {
+        logBleDebug(
+            "BLE desc write req dev=${device.address} svc=${descriptor.characteristic.service.uuid} ch=${descriptor.characteristic.uuid} desc=${descriptor.uuid} value=${toHex(value)}"
+        )
         // Convention compliance: Track CCCD state
         if (descriptor.uuid == CLIENT_CHARACTERISTIC_CONFIG && value != null) {
-            val isEnabled = value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) ||
-                           value.contentEquals(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
-            val isDisabled = value.contentEquals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE)
+            // CCCD is a little-endian uint16: 0 disables, 1 notifies, 2 indicates.
+            val configuration = if (value.size == 2 && value[1] == 0.toByte()) value[0].toInt() else -1
+            val isEnabled = configuration == 1 || configuration == 2
+            val isDisabled = configuration == 0
 
             synchronized(notificationSubscriptions) {
                 val deviceAddress = device.address
                 if (isEnabled) {
                     val uuidSet = notificationSubscriptions.getOrPut(deviceAddress) { mutableSetOf() }
                     uuidSet.add(descriptor.characteristic.uuid)
-                    Timber.d("Notifications enabled for ${descriptor.characteristic.uuid} on $deviceAddress")
+                    logBleDebug("BLE CCCD enabled ch=${descriptor.characteristic.uuid} dev=$deviceAddress")
                 } else if (isDisabled) {
+                    pendingNotifications.removeAll {
+                        it.device == device && it.characteristic.uuid == descriptor.characteristic.uuid
+                    }
                     notificationSubscriptions[deviceAddress]?.remove(descriptor.characteristic.uuid)
                     if (notificationSubscriptions[deviceAddress]?.isEmpty() == true) {
                         notificationSubscriptions.remove(deviceAddress)
                     }
-                    Timber.d("Notifications disabled for ${descriptor.characteristic.uuid} on $deviceAddress")
+                    logBleDebug("BLE CCCD disabled ch=${descriptor.characteristic.uuid} dev=$deviceAddress")
                 }
             }
         }
@@ -827,30 +1316,45 @@ class BleServer(
             val cadence: List<Float>,
             val power: List<Float>,
             val speed: List<Float>,
-            val resistance: List<Float>
+            val resistance: List<Float>,
+            val incline: List<Float>
     )
 
     private fun startSensorDataUpdates() {
         sensorDataJob?.cancel()
         sensorDataJob = launch {
+            sensorInterface.bikeControl?.takeIf { it.supported }?.let { control ->
+                launch {
+                    control.state.collect { state ->
+                        synchronized(this@BleServer) {
+                            if (!isActive) return@collect
+                            registeredServices.filterIsInstance<FitnessMachineService>()
+                                .forEach { it.onControlStateChanged(state) }
+                        }
+                    }
+                }
+            }
             val mutex = Mutex()
             val cadenceBuffer = mutableListOf<Float>()
             val powerBuffer = mutableListOf<Float>()
             val speedBuffer = mutableListOf<Float>()
             val resistanceBuffer = mutableListOf<Float>()
+            val inclineBuffer = mutableListOf<Float>()
 
             launch {
                 combine(
                                 sensorInterface.cadence,
                                 sensorInterface.power,
                                 sensorInterface.speed,
-                                sensorInterface.resistance
-                        ) { cadence, power, speed, resistance ->
+                                sensorInterface.resistance,
+                                sensorInterface.incline
+                        ) { cadence, power, speed, resistance, incline ->
                             mutex.withLock {
                                 cadenceBuffer.add(cadence)
                                 powerBuffer.add(power)
                                 speedBuffer.add(speed)
                                 resistanceBuffer.add(resistance)
+                                inclineBuffer.add(incline)
                             }
                         }
                         .collect()
@@ -870,13 +1374,15 @@ class BleServer(
                                                 cadenceBuffer.toList(),
                                                 powerBuffer.toList(),
                                                 speedBuffer.toList(),
-                                                resistanceBuffer.toList()
+                                                resistanceBuffer.toList(),
+                                                inclineBuffer.toList()
                                         )
                                                 .also {
                                                     cadenceBuffer.clear()
                                                     powerBuffer.clear()
                                                     speedBuffer.clear()
                                                     resistanceBuffer.clear()
+                                                    inclineBuffer.clear()
                                                 }
                             }
                     buffers?.let { data ->
@@ -884,20 +1390,25 @@ class BleServer(
                         val rCadence = robustAverage(data.cadence)
                         val rPower = robustAverage(data.power)
                         val rSpeedMph = robustAverage(data.speed) // mph
-                        val rResistance = robustAverage(data.resistance)
 
                         val sCadence = smoothCadence(rCadence)
                         val sPower = smoothPower(rPower)
                         val sSpeedMph = smoothSpeed(rSpeedMph)
-                        val sResistance = smoothResistance(rResistance)
+                        // Resistance is a discrete setting, already spike-filtered by the
+                        // sensor interface. Averaging/smoothing invents intermediate levels
+                        // (e.g. 99.7 for a received 100) and delays both increases and decreases.
+                        val resistance = data.resistance.lastOrNull { it.isFinite() } ?: 0f
+                        val incline = data.incline.lastOrNull { it.isFinite() } ?: 0f
 
                         // Convert mph -> km/h for wheel calculations
                         val sSpeedKmh = sSpeedMph * 1.60934f
                         // Update shared CSC counters using km/h for wheel and RPM for crank
                         updateWheelAndCrankRev(sSpeedKmh, sCadence)
-                        // Notify services with smoothed values (speed remains mph; services handle their unit needs)
-                        registeredServices.forEach {
-                            it.onSensorDataUpdated(sCadence, sPower, sSpeedMph, sResistance)
+                        // Speed remains mph; resistance is the latest sensor setting.
+                        synchronized(this@BleServer) {
+                            if (isActive) registeredServices.forEach {
+                                it.onSensorDataUpdated(sCadence, sPower, sSpeedMph, resistance, incline)
+                            }
                         }
                     }
                 }
@@ -946,7 +1457,6 @@ class BleServer(
     private var smoothedCadence: Float? = null
     private var smoothedPower: Float? = null
     private var smoothedSpeedMph: Float? = null
-    private var smoothedResistance: Float? = null
 
     private fun smooth(prev: Float?, value: Float, alpha: Float): Float =
         if (prev == null) value else (alpha * value + (1f - alpha) * prev)
@@ -966,11 +1476,6 @@ class BleServer(
     private fun smoothSpeed(vMph: Float, alpha: Float = 0.7f): Float {
         smoothedSpeedMph = smooth(smoothedSpeedMph, vMph, alpha)
         return smoothedSpeedMph!!
-    }
-
-    private fun smoothResistance(v: Float, alpha: Float = 0.7f): Float {
-        smoothedResistance = smooth(smoothedResistance, v, alpha)
-        return smoothedResistance!!
     }
 
     // CSC shared state (used by multiple services)

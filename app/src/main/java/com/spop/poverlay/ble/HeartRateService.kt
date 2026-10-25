@@ -37,7 +37,7 @@ class HeartRateService(server: BleServer) : BaseBleService(server) {
         addCharacteristic(bodySensorLocationCharacteristic)
     }
 
-    override fun onSensorDataUpdated(cadence: Float, power: Float, speed: Float, resistance: Float) {
+    override fun onSensorDataUpdated(cadence: Float, power: Float, speed: Float, resistance: Float, incline: Float) {
         val heartRate = HeartRateManager.heartRate.value ?: return
         if (heartRate <= 0) return
 
@@ -50,6 +50,7 @@ class HeartRateService(server: BleServer) : BaseBleService(server) {
                 (heartRate and 0xFF).toByte()
             )
         )
+        server.notifyDirConCharacteristicChanged(measurementCharacteristic)
 
         for (device in connectedDevices) {
             server.notifyCharacteristicChanged(device, measurementCharacteristic, false)

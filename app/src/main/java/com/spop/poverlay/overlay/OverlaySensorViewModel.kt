@@ -5,23 +5,28 @@ package com.spop.poverlay.overlay
 import android.app.Application
 import android.content.Intent
 import androidx.compose.runtime.mutableStateListOf
-import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.viewModelScope
 import com.spop.poverlay.MainActivity
 import com.spop.poverlay.sensor.DeadSensorDetector
+import com.spop.poverlay.sensor.interfaces.DeviceType
 import com.spop.poverlay.sensor.heartrate.HeartRateManager
 import com.spop.poverlay.sensor.interfaces.SensorInterface
 import com.spop.poverlay.util.smoothSensorValue
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.sample
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.CoroutineContext
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
@@ -29,8 +34,28 @@ import kotlin.time.Duration.Companion.minutes
 private const val MphToKph = 1.60934
 
 enum class MetricType {
-    POWER, CADENCE, RESISTANCE, SPEED, HEART_RATE
+    POWER, CADENCE, RESISTANCE, SPEED, HEART_RATE, INCLINE
 }
+
+/**
+ * The device-appropriate set of primary metric cards, in display order.
+ *
+ * A treadmill reports real speed and incline but always 0 for cadence/resistance,
+ * and its power is only a rough derived approximation, so those cards are hidden.
+ * A bike shows the full power/cadence/resistance/speed set. This is the single
+ * source of truth for which metrics appear and which are selectable for the chart,
+ * keeping the main and minimized overlays consistent. Heart rate is handled separately;
+ * cycling-based calorie estimates are shown only on bikes.
+ */
+fun deviceMetrics(deviceType: DeviceType): List<MetricType> = when (deviceType) {
+    DeviceType.Tread -> listOf(MetricType.SPEED, MetricType.INCLINE)
+    DeviceType.Bike -> listOf(
+        MetricType.POWER, MetricType.CADENCE, MetricType.RESISTANCE, MetricType.SPEED
+    )
+}
+
+/** The metric shown on the chart by default: the device's primary metric. */
+fun defaultMetricFor(deviceType: DeviceType): MetricType = deviceMetrics(deviceType).first()
 
 /**
  * Calorie calculation constants using Gross Mechanical Efficiency (GME) method:
@@ -51,11 +76,16 @@ private const val CyclingEfficiency = 0.22 // 22% efficiency (typical for cyclin
 private const val CaloriesPerJoule = 4184.0 // Joules per kcal (thermochemical calorie definition)
 
 class OverlaySensorViewModel(
-    application: Application,
+    private val application: Application,
     private val sensorInterface: SensorInterface,
     private val deadSensorDetector: DeadSensorDetector,
-    private val timerViewModel: OverlayTimerViewModel
-) : AndroidViewModel(application) {
+    private val timerViewModel: OverlayTimerViewModel,
+    override val coroutineContext: CoroutineContext,
+) : CoroutineScope {
+    val emulatedModel = (sensorInterface as? com.spop.poverlay.sensor.interfaces.EmulatedSensorInterface)?.model?.label
+    val bikeControlState = sensorInterface.bikeControl?.state
+        ?: MutableStateFlow(com.spop.poverlay.control.ControlState())
+    fun shift(direction: Int) { sensorInterface.bikeControl?.shift(direction) }
 
     companion object {
         // The sensor does not necessarily return new value this quickly
@@ -69,6 +99,47 @@ class OverlaySensorViewModel(
     }
 
 
+    // Reactive device type. Detection is platform-based and synchronous, so the interface
+    // is fixed at construction and this flow emits a single, correct value; deriving the
+    // metric set from it keeps the overlay's cards consistent with the chosen device.
+    private val deviceType: StateFlow<DeviceType> =
+        sensorInterface.deviceTypeFlow.stateIn(
+            this, SharingStarted.Eagerly, sensorInterface.deviceType
+        )
+
+    // Device-appropriate metric set (single source of truth). See deviceMetrics().
+    private val visibleMetrics: StateFlow<List<MetricType>> =
+        deviceType.map(::deviceMetrics).stateIn(
+            this, SharingStarted.Eagerly, deviceMetrics(sensorInterface.deviceType)
+        )
+
+    /** Default chart metric for this device (Power on a bike, Speed on a tread). */
+    val defaultMetric: StateFlow<MetricType> =
+        deviceType.map(::defaultMetricFor).stateIn(
+            this, SharingStarted.Eagerly, defaultMetricFor(sensorInterface.deviceType)
+        )
+
+    /** Which primary metric cards to show, derived reactively from [visibleMetrics]. */
+    val showPowerCard: StateFlow<Boolean> = visibleMetricFlow(MetricType.POWER)
+    val showCadenceCard: StateFlow<Boolean> = visibleMetricFlow(MetricType.CADENCE)
+    val showResistanceCard: StateFlow<Boolean> = visibleMetricFlow(MetricType.RESISTANCE)
+    val showSpeedCard: StateFlow<Boolean> = visibleMetricFlow(MetricType.SPEED)
+
+    // A treadmill reports incline; a bike does not, so only show the card for a Tread.
+    val showInclineCard: StateFlow<Boolean> = visibleMetricFlow(MetricType.INCLINE)
+
+    // True while a treadmill is active. Drives the overlay's tread-specific spatial
+    // layout (incline left, chart center, speed right) mirroring the Tread's physical
+    // controls; the bike layout is used otherwise.
+    val isTread: StateFlow<Boolean> = deviceType.map { it == DeviceType.Tread }.stateIn(
+        this, SharingStarted.Eagerly, sensorInterface.deviceType == DeviceType.Tread
+    )
+
+    private fun visibleMetricFlow(metric: MetricType): StateFlow<Boolean> =
+        visibleMetrics.map { metric in it }.stateIn(
+            this, SharingStarted.Eagerly, metric in visibleMetrics.value
+        )
+
     //TODO: Move this logic to dialog view model
     private val mutableIsMinimized = MutableStateFlow(false)
     val isMinimized = mutableIsMinimized.asStateFlow()
@@ -76,7 +147,7 @@ class OverlaySensorViewModel(
     private val mutableErrorMessage = MutableStateFlow<String?>(null)
     val errorMessage = mutableErrorMessage.asStateFlow()
 
-    private val mutableSelectedMetric = MutableStateFlow(MetricType.POWER)
+    private val mutableSelectedMetric = MutableStateFlow(defaultMetric.value)
     val selectedMetric = mutableSelectedMetric.asStateFlow()
 
     fun onDismissErrorPressed() {
@@ -96,7 +167,7 @@ class OverlaySensorViewModel(
     }
 
     fun onOverlayDoubleTap() {
-        getApplication<Application>().apply {
+        application.apply {
             val intent = Intent(this, MainActivity::class.java)
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             startActivity(intent)
@@ -104,7 +175,8 @@ class OverlaySensorViewModel(
     }
 
     fun onMetricSelected(metric: MetricType) {
-        viewModelScope.launch {
+        if (metric != MetricType.HEART_RATE && metric !in visibleMetrics.value) return
+        launch(Dispatchers.Main.immediate) {
             mutableSelectedMetric.emit(metric)
         }
     }
@@ -119,6 +191,21 @@ class OverlaySensorViewModel(
     }
 
     private var useMph = MutableStateFlow(true)
+
+    // Session stats are accumulated at the raw sensor rate (for accurate time-weighting), but
+    // only published to the UI-facing StateFlows below every UiUpdatePeriod. Publishing every
+    // sample (~20+/s on a Bike+) recomposed the overlay and rebuilt its chart on nearly every
+    // frame. The collector and the publish ticker share this serial dispatcher, so the
+    // accumulators are never touched concurrently.
+    private val statsDispatcher = Dispatchers.Default.limitedParallelism(1)
+    private var statsDirty = false
+    private var maxPowerAcc = 0f
+    private var maxCadenceAcc = 0f
+    private var maxResistanceAcc = 0f
+    private var maxSpeedAcc = 0f
+    private var maxHeartRateAcc = 0f
+    private var totalEnergyAcc = 0f // kilojoules
+    private var totalDistanceAcc = 0f // miles
 
     // Max value tracking
     private val mutableMaxPower = MutableStateFlow(0f)
@@ -177,33 +264,30 @@ class OverlaySensorViewModel(
         // Check if actively moving (for accumulating averages/totals and timer)
         val isCurrentlyMoving = cadence >= 1f || speed >= 0.1f
 
-        // Update movement state for timer auto-start/pause
+        // Update movement state for timer auto-start/pause (only emits on change)
         if (mutableIsMoving.value != isCurrentlyMoving) {
             mutableIsMoving.value = isCurrentlyMoving
         }
 
+        var forcePublish = false
         if (allZero) {
             // Check if we've been at zero for longer than the timeout
             if (currentTime - lastNonZeroTime > MaxResetTimeout.inWholeMilliseconds) {
-                // Reset all max values and session totals
-                mutableMaxPower.value = 0f
-                mutableMaxCadence.value = 0f
-                mutableMaxResistance.value = 0f
-                mutableMaxSpeed.value = 0f
-                mutableMaxHeartRate.value = 0f
-                mutableTotalEnergy.value = 0f
-                mutableTotalDistance.value = 0f
-                // Reset averages
+                // Reset all max values, session totals and averages
+                maxPowerAcc = 0f
+                maxCadenceAcc = 0f
+                maxResistanceAcc = 0f
+                maxSpeedAcc = 0f
+                maxHeartRateAcc = 0f
+                totalEnergyAcc = 0f
+                totalDistanceAcc = 0f
                 totalActiveTime = 0f
                 sumSpeed = 0f
                 sumResistance = 0f
                 sumCadence = 0f
                 sumHeartRate = 0f
                 totalHeartRateTime = 0f
-                mutableAvgSpeed.value = 0f
-                mutableAvgResistance.value = 0f
-                mutableAvgCadence.value = 0f
-                mutableAvgHeartRate.value = 0f
+                forcePublish = true
                 // Signal session reset for timer
                 mutableSessionReset.value = currentTime
             }
@@ -212,19 +296,18 @@ class OverlaySensorViewModel(
             lastNonZeroTime = currentTime
 
             // Update max values (always, even when not moving)
-            if (power > mutableMaxPower.value) mutableMaxPower.value = power
-            if (cadence > mutableMaxCadence.value) mutableMaxCadence.value = cadence
-            if (resistance > mutableMaxResistance.value) mutableMaxResistance.value = resistance
-            if (speed > mutableMaxSpeed.value) mutableMaxSpeed.value = speed
-            if (heartRate > mutableMaxHeartRate.value) mutableMaxHeartRate.value = heartRate
+            if (power > maxPowerAcc) maxPowerAcc = power
+            if (cadence > maxCadenceAcc) maxCadenceAcc = cadence
+            if (resistance > maxResistanceAcc) maxResistanceAcc = resistance
+            if (speed > maxSpeedAcc) maxSpeedAcc = speed
+            if (heartRate > maxHeartRateAcc) maxHeartRateAcc = heartRate
 
             // Only accumulate totals and averages when actively moving
             if (isCurrentlyMoving) {
-                // Accumulate session totals
                 // Energy: power (watts) × time (seconds) = joules, divide by 1000 for kJ
-                mutableTotalEnergy.value += (power * deltaSeconds) / 1000f
+                totalEnergyAcc += (power * deltaSeconds) / 1000f
                 // Distance: speed (mph) × time (hours) = miles
-                mutableTotalDistance.value += speed * (deltaSeconds / 3600f)
+                totalDistanceAcc += speed * (deltaSeconds / 3600f)
 
                 // Accumulate time-weighted sums for averages
                 totalActiveTime += deltaSeconds
@@ -235,23 +318,37 @@ class OverlaySensorViewModel(
                     sumHeartRate += heartRate * deltaSeconds
                     totalHeartRateTime += deltaSeconds
                 }
-
-                // Update averages
-                if (totalActiveTime > 0f) {
-                    mutableAvgSpeed.value = sumSpeed / totalActiveTime
-                    mutableAvgResistance.value = sumResistance / totalActiveTime
-                    mutableAvgCadence.value = sumCadence / totalActiveTime
-                }
-                if (totalHeartRateTime > 0f) {
-                    mutableAvgHeartRate.value = sumHeartRate / totalHeartRateTime
-                }
             }
         }
+
+        if (forcePublish) {
+            statsDirty = false
+            publishSessionStats()
+        } else {
+            statsDirty = true
+        }
+    }
+
+    private fun publishSessionStats() {
+        mutableMaxPower.value = maxPowerAcc
+        mutableMaxCadence.value = maxCadenceAcc
+        mutableMaxResistance.value = maxResistanceAcc
+        mutableMaxSpeed.value = maxSpeedAcc
+        mutableMaxHeartRate.value = maxHeartRateAcc
+        mutableTotalEnergy.value = totalEnergyAcc
+        mutableTotalDistance.value = totalDistanceAcc
+        mutableAvgSpeed.value = if (totalActiveTime > 0f) sumSpeed / totalActiveTime else 0f
+        mutableAvgResistance.value = if (totalActiveTime > 0f) sumResistance / totalActiveTime else 0f
+        mutableAvgCadence.value = if (totalActiveTime > 0f) sumCadence / totalActiveTime else 0f
+        mutableAvgHeartRate.value = if (totalHeartRateTime > 0f) sumHeartRate / totalHeartRateTime else 0f
     }
 
     val powerValue = sensorInterface.power
         .sample(UiUpdatePeriod)
         .map { "%.0f".format(it) }
+    val pelotonPowerComparison = combine(sensorInterface.nativePower, sensorInterface.usesExternalPower) { watts, external ->
+        if (external) "Peloton %.0f W".format(watts) else null
+    }
     val rpmValue = sensorInterface.cadence
         .sample(UiUpdatePeriod)
         .map { "%.0f".format(it) }
@@ -278,8 +375,12 @@ class OverlaySensorViewModel(
         }
     }
 
+    val inclineValue = sensorInterface.incline
+        .sample(UiUpdatePeriod)
+        .map { "%.1f".format(it) }
+
     fun onClickedSpeedUnit() {
-        viewModelScope.launch {
+        launch(Dispatchers.Main.immediate) {
             useMph.emit(!useMph.value)
         }
     }
@@ -298,7 +399,7 @@ class OverlaySensorViewModel(
     private fun setupCaloriesAccumulation() {
         var lastUpdateTime = System.currentTimeMillis()
         
-        viewModelScope.launch(Dispatchers.IO) {
+        launch(Dispatchers.IO) {
             combine(
                 sensorInterface.power,
                 timerViewModel.elapsedSeconds
@@ -328,6 +429,7 @@ class OverlaySensorViewModel(
     val resistanceGraph = mutableStateListOf<Float>()
     val speedGraph = mutableStateListOf<Float>()
     val heartRateGraph = mutableStateListOf<Float>()
+    val inclineGraph = mutableStateListOf<Float>()
 
     fun getGraphForMetric(metric: MetricType): List<Float> {
         return when (metric) {
@@ -336,12 +438,13 @@ class OverlaySensorViewModel(
             MetricType.RESISTANCE -> resistanceGraph
             MetricType.SPEED -> speedGraph
             MetricType.HEART_RATE -> heartRateGraph
+            MetricType.INCLINE -> inclineGraph
         }
     }
 
     private fun setupGraphData() {
         // Power graph
-        viewModelScope.launch(Dispatchers.IO) {
+        launch(Dispatchers.IO) {
             sensorInterface.power.smoothSensorValue()
                 .sample(UiUpdatePeriod)
                 .collect(object : FlowCollector<Float> {
@@ -357,7 +460,7 @@ class OverlaySensorViewModel(
         }
 
         // Cadence graph
-        viewModelScope.launch(Dispatchers.IO) {
+        launch(Dispatchers.IO) {
             sensorInterface.cadence.smoothSensorValue()
                 .sample(UiUpdatePeriod)
                 .collect(object : FlowCollector<Float> {
@@ -373,7 +476,7 @@ class OverlaySensorViewModel(
         }
 
         // Resistance graph
-        viewModelScope.launch(Dispatchers.IO) {
+        launch(Dispatchers.IO) {
             sensorInterface.resistance.smoothSensorValue()
                 .sample(UiUpdatePeriod)
                 .collect(object : FlowCollector<Float> {
@@ -389,7 +492,7 @@ class OverlaySensorViewModel(
         }
 
         // Speed graph
-        viewModelScope.launch(Dispatchers.IO) {
+        launch(Dispatchers.IO) {
             sensorInterface.speed.smoothSensorValue()
                 .sample(UiUpdatePeriod)
                 .collect(object : FlowCollector<Float> {
@@ -405,7 +508,7 @@ class OverlaySensorViewModel(
         }
 
         // Heart rate graph
-        viewModelScope.launch(Dispatchers.IO) {
+        launch(Dispatchers.IO) {
             HeartRateManager.heartRate
                 .map { (it ?: 0).toFloat() }
                 .smoothSensorValue()
@@ -421,10 +524,38 @@ class OverlaySensorViewModel(
                     }
                 })
         }
+
+        // Incline graph
+        launch(Dispatchers.IO) {
+            sensorInterface.incline.smoothSensorValue()
+                .sample(UiUpdatePeriod)
+                .collect(object : FlowCollector<Float> {
+                    override suspend fun emit(value: Float) {
+                        withContext(Dispatchers.Main) {
+                            inclineGraph.add(value)
+                            if (inclineGraph.size > GraphMaxDataPoints) {
+                                inclineGraph.removeFirst()
+                            }
+                        }
+                    }
+                })
+        }
     }
 
     private fun setupMaxTracking() {
-        viewModelScope.launch(Dispatchers.IO) {
+        // Publish pending stats on a fixed tick rather than per sample, so the last update is
+        // always flushed even if the sensor stream goes quiet right after it.
+        launch(statsDispatcher) {
+            while (true) {
+                delay(UiUpdatePeriod)
+                if (statsDirty) {
+                    statsDirty = false
+                    publishSessionStats()
+                }
+            }
+        }
+        // One sequential collector owns the accumulators, so no main-thread hop is needed.
+        launch(statsDispatcher) {
             combine(
                 sensorInterface.power,
                 sensorInterface.cadence,
@@ -435,9 +566,7 @@ class OverlaySensorViewModel(
                 floatArrayOf(power, cadence, resistance, speed, heartRate)
             }.collect(object : FlowCollector<FloatArray> {
                 override suspend fun emit(value: FloatArray) {
-                    withContext(Dispatchers.Main) {
-                        updateSessionStats(value[0], value[1], value[2], value[3], value[4])
-                    }
+                    updateSessionStats(value[0], value[1], value[2], value[3], value[4])
                 }
             })
         }
@@ -448,7 +577,20 @@ class OverlaySensorViewModel(
         setupGraphData()
         setupCaloriesAccumulation()
         setupMaxTracking()
-        viewModelScope.launch(Dispatchers.IO) {
+
+        // When the active device swaps (Bike->Tread), reset the chart selection if the
+        // previously selected metric no longer applies to the new device. Heart rate is
+        // gated separately (on a connected monitor), so leave that selection alone.
+        launch(Dispatchers.Main.immediate) {
+            deviceType.collect { type ->
+                val selected = mutableSelectedMetric.value
+                if (selected != MetricType.HEART_RATE && selected !in deviceMetrics(type)) {
+                    mutableSelectedMetric.value = defaultMetricFor(type)
+                }
+            }
+        }
+
+        launch(Dispatchers.IO) {
             deadSensorDetector.deadSensorDetected.collect(object : FlowCollector<Unit> {
                 override suspend fun emit(value: Unit) {
                     onDeadSensor()
@@ -456,7 +598,7 @@ class OverlaySensorViewModel(
             })
         }
 
-        viewModelScope.launch(Dispatchers.IO) {
+        launch(Dispatchers.IO) {
             errorMessage.collect(object : FlowCollector<String?> {
                 override suspend fun emit(value: String?) {
                     // Leave minimized state if we're showing an error message

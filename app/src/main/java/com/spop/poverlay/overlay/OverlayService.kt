@@ -27,23 +27,17 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.DefaultLifecycleObserver
-import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.spop.poverlay.ConfigurationRepository
 import com.spop.poverlay.GrupettoApplication
+import com.spop.poverlay.sensor.heartrate.HeartRateManager
 import com.spop.poverlay.MainActivity
 import com.spop.poverlay.R
 
 import com.spop.poverlay.sensor.CadenceWatchdog
 import com.spop.poverlay.sensor.DeadSensorDetector
-import com.spop.poverlay.sensor.interfaces.DummySensorInterface
-import com.spop.poverlay.sensor.interfaces.PelotonBikeSensorInterfaceV1New
-import com.spop.poverlay.sensor.interfaces.PelotonBikePlusSensorInterface
-import com.spop.poverlay.util.IsBikePlus
-import com.spop.poverlay.util.IsG700CrossTrainer
-import com.spop.poverlay.util.IsRunningOnPeloton
 import com.spop.poverlay.util.LifecycleEnabledService
 import com.spop.poverlay.util.disableAnimations
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -81,11 +75,9 @@ class OverlayService : LifecycleEnabledService() {
         //Defined relative to the height of the screen
         const val VerticalMoveDragThreshold = .5f
 
-        // Replace with DeadSensorInterface to simulate a dead sensor
-        val EmulatorSensorInterface by lazy { DummySensorInterface() }
-
         private val mutableIsRunning = MutableStateFlow(false)
         val isRunning = mutableIsRunning.asStateFlow()
+        internal val configurationVisible = MutableStateFlow(false)
     }
 
     private var wakeLock: PowerManager.WakeLock? = null
@@ -94,30 +86,38 @@ class OverlayService : LifecycleEnabledService() {
     private var touchTargetView: View? = null
     private var windowManager: WindowManager? = null
     private var sensorViewModel: OverlaySensorViewModel? = null
+    private var shifterWindows: FixedShifterWindows? = null
     private var minimizedStateBeforeConfiguration: Boolean? = null
     private val bleServer by lazy { (application as GrupettoApplication).bleServer }
+    private val antPlusServer by lazy { (application as GrupettoApplication).antPlusServer }
 
     override fun onCreate() {
         super.onCreate()
         mutableIsRunning.value = true
-        syncBackgroundExecutionGuards()
         val notification = prepareNotification(NotificationManagerCompat.from(this))
+        val locationType = if (hasBackgroundLocationAccess()) ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION else 0
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(
-                OverlayServiceId, 
+                OverlayServiceId,
                 notification,
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
+                        locationType
             )
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 OverlayServiceId,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+                        locationType
             )
         } else {
             startForeground(OverlayServiceId, notification)
         }
+        if ((application as GrupettoApplication).emulatedModel == null) HeartRateManager.start(this)
+        if ((application as GrupettoApplication).emulatedModel == null)
+            (application as GrupettoApplication).powerMeterManager.start()
+        syncBackgroundExecutionGuards()
         buildDialog()
     }
 
@@ -156,6 +156,11 @@ class OverlayService : LifecycleEnabledService() {
         super.onDestroy()
     }
 
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        shifterWindows?.refresh()
+    }
+
     private fun buildDialog() {
         val wm = getSystemService(WINDOW_SERVICE) as WindowManager
         windowManager = wm
@@ -164,46 +169,35 @@ class OverlayService : LifecycleEnabledService() {
             resources.displayMetrics.heightPixels.toFloat()
         )
 
-        val sensorInterface = if (IsRunningOnPeloton) {
-            if (IsG700CrossTrainer || IsBikePlus) {
-                PelotonBikePlusSensorInterface(this).also {
-                    lifecycle.addObserver(LifecycleEventObserver { _, event ->
-                        if (event == Lifecycle.Event.ON_DESTROY) {
-                            it.stop()
-                        }
-                    })
-                }
-            } else {
-                PelotonBikeSensorInterfaceV1New(this).also {
-                    lifecycle.addObserver(LifecycleEventObserver { _, event ->
-                        if (event == Lifecycle.Event.ON_DESTROY) {
-                            it.stop()
-                        }
-                    })
-                }
-            }
-
-        } else {
-            EmulatorSensorInterface
-        }
+        // Shared, Application-scoped sensor interface (also used by bleServer/antPlusServer) -
+        // do not .stop() it here, its lifetime is the process lifetime.
+        val sensorInterface = (application as GrupettoApplication).sensorInterface
+        val configurationRepository = ConfigurationRepository(applicationContext, this,
+            (application as GrupettoApplication).configurationPreferencesName)
 
         val timerViewModel = OverlayTimerViewModel(
-            application,
-            ConfigurationRepository(applicationContext, this),
-            sensorInterface.power
+            configurationRepository,
+            sensorInterface.power,
+            this.coroutineContext,
         )
 
         val sensorViewModel = OverlaySensorViewModel(
             application,
             sensorInterface,
             DeadSensorDetector(sensorInterface, this.coroutineContext),
-            timerViewModel
+            timerViewModel,
+            this.coroutineContext,
         )
         this.sensorViewModel = sensorViewModel
         // Wire up timer to auto-start/pause based on movement
         timerViewModel.observeMovement(sensorViewModel.isMoving, sensorViewModel.sessionReset)
 
-        val dialogViewModel = OverlayDialogViewModel(screenSize, sensorViewModel.isMinimized)
+        val dialogViewModel = OverlayDialogViewModel(
+            screenSize,
+            sensorViewModel.isMinimized,
+            configurationRepository.overlayHorizontalOffset,
+            configurationRepository.overlayLocation
+        )
 
         // Initialize and start watchdog (always enabled)
         val watchdogThreshold = 30.minutes
@@ -221,7 +215,7 @@ class OverlayService : LifecycleEnabledService() {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 watchdog.restartTriggered.collect {
                     Timber.w(
-                        "Watchdog triggered restart - no cadence detected for ${watchdogThreshold.inWholeMinutes} minutes"
+                        "Watchdog triggered restart - no movement detected for ${watchdogThreshold.inWholeMinutes} minutes"
                     )
                     restartToOverlay()
                 }
@@ -275,10 +269,16 @@ class OverlayService : LifecycleEnabledService() {
                     dialogViewModel::processVerticalDrag,
                     dialogViewModel::processHideProgress,
                     dialogViewModel::onOverlayLayout,
-                    dialogViewModel::onTimerOverlayLayout
+                    dialogViewModel::onTimerOverlayLayout,
+                    onDragFinished = {
+                        configurationRepository.setOverlayPosition(
+                            dialogViewModel.dialogOrigin.value.x,
+                            dialogViewModel.dialogLocation.value
+                        )
+                    }
                 )
             }
-            alpha = 0.9f
+            alpha = 1f
             isFocusable = false
             clipToPadding = false
             clipChildren = false
@@ -289,7 +289,18 @@ class OverlayService : LifecycleEnabledService() {
         wm.addView(overlay, overlayParams)
 
         wm.addView(touchTarget, touchTargetParams)
-        //touchTarget.clipChildren = false
+        if (sensorInterface.bikeControl?.supported == true) {
+            shifterWindows = FixedShifterWindows(this, this, this, onShift = sensorViewModel::shift)
+            lifecycleScope.launch {
+                repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                    combine(sensorViewModel.bikeControlState, configurationRepository.showShifters,
+                        configurationRepository.shifterInset, configurationVisible) { control, enabled, inset, configuring ->
+                        shifterWindows?.update(showRideShifters(control.connected, enabled, configuring), inset,
+                            control.mode == com.spop.poverlay.control.ControlMode.Erg)
+                    }.collect {}
+                }
+            }
+        }
         //touchTarget.clipToPadding = false
         //Subscribe to Dialog view model and update views
         lifecycleScope.launch {
@@ -451,17 +462,49 @@ class OverlayService : LifecycleEnabledService() {
     }
 
     private fun syncBackgroundExecutionGuards() {
-        if (isBleTxEnabled() && hasBleRuntimePermissions()) {
+        if ((application as GrupettoApplication).emulatedModel != null) return
+        val bleEnabled = isBleTxEnabled()
+        val dirConEnabled = isDirConEnabled()
+        val shouldRunBle = bleEnabled && hasBleRuntimePermissions()
+
+        if (shouldRunBle) {
+            bleServer.setDirConTransportEnabled(dirConEnabled)
             bleServer.start()
+        } else {
+            bleServer.stop()
+            bleServer.setDirConTransportEnabled(dirConEnabled)
+        }
+
+        val antEnabled = antPlusServer.isSupported && getSharedPreferences(
+            ConfigurationRepository.SharedPrefsName, MODE_PRIVATE
+        ).getBoolean(ConfigurationRepository.Preferences.AntPlusTxEnabled.key, false)
+        if (antEnabled) antPlusServer.start() else antPlusServer.stop()
+
+        if (shouldRunBle || dirConEnabled || antEnabled) {
             acquireWakeLock()
         } else {
             releaseWakeLock()
         }
     }
 
+    private fun hasBackgroundLocationAccess(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
+        val granted = PackageManager.PERMISSION_GRANTED
+        return ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_FINE_LOCATION) == granted &&
+            ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_BACKGROUND_LOCATION) == granted &&
+            androidx.core.location.LocationManagerCompat.isLocationEnabled(
+                getSystemService(LOCATION_SERVICE) as android.location.LocationManager
+            )
+    }
+
     private fun isBleTxEnabled(): Boolean {
         val prefs = getSharedPreferences(ConfigurationRepository.SharedPrefsName, MODE_PRIVATE)
         return prefs.getBoolean(ConfigurationRepository.Preferences.BleTxEnabled.key, true)
+    }
+
+    private fun isDirConEnabled(): Boolean {
+        val prefs = getSharedPreferences(ConfigurationRepository.SharedPrefsName, MODE_PRIVATE)
+        return prefs.getBoolean(ConfigurationRepository.Preferences.DirConEnabled.key, true)
     }
 
     private fun hasBleRuntimePermissions(): Boolean {
@@ -496,6 +539,8 @@ class OverlayService : LifecycleEnabledService() {
     }
 
     private fun removeOverlayViews() {
+        shifterWindows?.close()
+        shifterWindows = null
         val wm = windowManager
         val hasViews = overlayView != null || touchTargetView != null
         if (wm != null && hasViews) {

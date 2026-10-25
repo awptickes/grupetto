@@ -10,8 +10,18 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.spop.poverlay.overlay.OverlaySensorViewModel
 import com.yabu.livechart.model.DataPoint
 import com.yabu.livechart.model.Dataset
-import com.yabu.livechart.view.LiveChart
 import com.yabu.livechart.view.LiveChartStyle
+import com.spop.poverlay.util.livechart.LiveChart
+import com.spop.poverlay.util.livechart.ZoneBand
+
+/** Content hash of what the chart draws; equal signatures produce identical frames. */
+internal fun chartSignature(data: Collection<Number>, maxValue: Float): Long {
+    var hash = maxValue.toRawBits().toLong()
+    for (value in data) {
+        hash = hash * 31 + value.toFloat().toRawBits()
+    }
+    return hash * 31 + data.size
+}
 
 @Composable
 fun LineChart(
@@ -21,9 +31,12 @@ fun LineChart(
     pauseChart: Boolean,
     fillColor: Color = Color.LightGray,
     lineColor: Color = Color.DarkGray,
+    zoneBands: List<ZoneBand>? = null,
 ) {
-    // Use key to force recreation when colors, maxValue, or data source change
-    key(lineColor, fillColor, maxValue, data) {
+    // Exclude lineColor/fillColor from key when zone bands are set — coloring is per-segment.
+    // maxValue is applied in update, so a new session max doesn't recreate the view.
+    val keyColors = if (zoneBands != null) null else Pair(lineColor, fillColor)
+    key(keyColors, data, zoneBands) {
         AndroidView(
             modifier = modifier,
             factory = { context ->
@@ -43,11 +56,18 @@ fun LineChart(
                 baselineStrokeWidth = 6f
                 mainCornerRadius = 40f
                 secondColor = android.graphics.Color.TRANSPARENT
-            }).disableTouchOverlay()
+            }).disableTouchOverlay().also { chart ->
+                zoneBands?.let { chart.setZoneBands(it) }
+            }
 
         },
         update = { view ->
-            if (!pauseChart) {
+            // update re-runs whenever the overlay recomposes, not only when the plotted data
+            // changes. Rebuilding the dataset allocates a point per sample and invalidates the
+            // view, so skip it unless the data or bounds actually differ from the last draw.
+            val signature = chartSignature(data, maxValue)
+            if (!pauseChart && view.tag != signature) {
+                view.tag = signature
                 view.setDataset(Dataset(data.mapIndexed { index, value ->
                     //Start values at 1f to keep line visible at all times
                     DataPoint(index.toFloat(), value.toFloat().coerceIn(1f, maxValue))
